@@ -1012,6 +1012,20 @@ cmd! {
 }
 
 cmd! {
+    /// LE Set Connectionless IQ Sampling Enable command [📖](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-7cb279b8-3634-75b5-d6fc-52a55172673d)
+    LeSetConnectionlessIqSamplingEnable(LE, 0x0053) {
+        LeSetConnectionlessIqSamplingEnableParams<'a> {
+            sync_handle: SyncHandle,
+            sampling_enable: bool,
+            slot_duration: u8,
+            max_sampled_ctes: u8,
+            switching_pattern: &'a [u8],
+        }
+        Return = SyncHandle;
+    }
+}
+
+cmd! {
     /// LE Set Connection CTE Transmit Parameters command [📖](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-a8cd66e1-b702-2d8e-c027-4f0a89d4f8a1)
     LeSetConnCteTransmitParams(LE, 0x0055) {
         LeSetConnCteTransmitParamsParams<'a> {
