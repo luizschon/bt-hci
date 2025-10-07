@@ -60,6 +60,74 @@ macro_rules! events {
             },
         }
 
+
+        /// An Event kind
+        #[non_exhaustive]
+        #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct EventKind(pub u8);
+
+        #[allow(non_upper_case_globals)]
+        impl EventKind {
+            $(
+                #[allow(missing_docs)]
+                pub const $name: EventKind = EventKind($code);
+            )+
+            #[allow(missing_docs)]
+            pub const Le: EventKind = EventKind(0x3F);
+        }
+
+        /// An Event HCI packet
+        #[derive(Debug, Clone, Hash)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct EventPacket<'a> {
+            /// Which kind of event.
+            pub kind: EventKind,
+            /// Event data.
+            pub data: &'a [u8],
+        }
+
+        impl<'a> EventPacket<'a> {
+            fn from_header_hci_bytes(header: EventPacketHeader, data: &'a [u8]) -> Result<Self, FromHciBytesError> {
+                let (kind, data) = EventKind::from_header_hci_bytes(header, data)?;
+                Ok(Self {
+                    kind,
+                    data,
+                })
+            }
+        }
+
+        impl EventKind {
+            fn from_header_hci_bytes(header: EventPacketHeader, data: &[u8]) -> Result<(Self, &[u8]), FromHciBytesError> {
+                let (data, _) = if data.len() < usize::from(header.params_len) {
+                    return Err(FromHciBytesError::InvalidSize);
+                } else {
+                    data.split_at(usize::from(header.params_len))
+                };
+
+                match header.code {
+                    $($code => Ok((Self::$name, data)),)+
+                    0x3e => Ok((Self::Le, data)),
+                    _ => {
+                        Ok((EventKind(header.code), data))
+                    }
+                }
+            }
+        }
+
+        impl<'a> TryFrom<EventPacket<'a>> for Event<'a> {
+            type Error = FromHciBytesError;
+            fn try_from(packet: EventPacket<'a>) -> Result<Self, Self::Error> {
+                match packet.kind {
+                    $(EventKind::$name => Ok(Self::$name($name::from_hci_bytes_complete(packet.data)?)),)+
+                    EventKind::Le => {
+                        Ok(Self::Le(LeEvent::from_hci_bytes_complete(packet.data)?))
+                    }
+                    EventKind(code) => Ok(Self::Unknown { code, params: packet.data }),
+                }
+            }
+        }
+
         impl<'a> Event<'a> {
             fn from_header_hci_bytes(header: EventPacketHeader, data: &'a [u8]) -> Result<(Self, &'a [u8]), FromHciBytesError> {
                 let (data, rest) = if data.len() < usize::from(header.params_len) {
@@ -215,8 +283,7 @@ events! {
     struct CommandComplete<'a>(0x0e) {
         num_hci_cmd_pkts: u8,
         cmd_opcode: Opcode,
-        status: Status, // All return parameters have status as the first field
-        return_param_bytes: RemainingBytes<'a>,
+        bytes: RemainingBytes<'a>,
     }
 
     /// Command Status event [📖](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-4d87067c-be74-d2ff-d5c4-86416bf7af91)
@@ -585,6 +652,51 @@ impl<'de> FromHciBytes<'de> for Event<'de> {
     }
 }
 
+impl<'de> FromHciBytes<'de> for EventPacket<'de> {
+    fn from_hci_bytes(data: &'de [u8]) -> Result<(Self, &'de [u8]), FromHciBytesError> {
+        let (header, data) = EventPacketHeader::from_hci_bytes(data)?;
+        let pkt = Self::from_header_hci_bytes(header, data)?;
+        Ok((pkt, &[]))
+    }
+}
+
+impl<'de> ReadHci<'de> for EventPacket<'de> {
+    const MAX_LEN: usize = 257;
+
+    fn read_hci<R: embedded_io::Read>(mut reader: R, buf: &'de mut [u8]) -> Result<Self, ReadHciError<R::Error>> {
+        let mut header = [0; 2];
+        reader.read_exact(&mut header)?;
+        let (header, _) = EventPacketHeader::from_hci_bytes(&header)?;
+        let params_len = usize::from(header.params_len);
+        if buf.len() < params_len {
+            Err(ReadHciError::BufferTooSmall)
+        } else {
+            let (buf, _) = buf.split_at_mut(params_len);
+            reader.read_exact(buf)?;
+            let pkt = Self::from_header_hci_bytes(header, buf)?;
+            Ok(pkt)
+        }
+    }
+
+    async fn read_hci_async<R: embedded_io_async::Read>(
+        mut reader: R,
+        buf: &'de mut [u8],
+    ) -> Result<Self, ReadHciError<R::Error>> {
+        let mut header = [0; 2];
+        reader.read_exact(&mut header).await?;
+        let (header, _) = EventPacketHeader::from_hci_bytes(&header)?;
+        let params_len = usize::from(header.params_len);
+        if buf.len() < params_len {
+            Err(ReadHciError::BufferTooSmall)
+        } else {
+            let (buf, _) = buf.split_at_mut(params_len);
+            reader.read_exact(buf).await?;
+            let pkt = Self::from_header_hci_bytes(header, buf)?;
+            Ok(pkt)
+        }
+    }
+}
+
 impl<'de> ReadHci<'de> for Event<'de> {
     const MAX_LEN: usize = 257;
 
@@ -623,6 +735,44 @@ impl<'de> ReadHci<'de> for Event<'de> {
 }
 
 impl CommandComplete<'_> {
+    /// Whether or not this event has a status
+    pub fn has_status(&self) -> bool {
+        self.cmd_opcode != Opcode::UNSOLICITED
+    }
+}
+
+impl<'d> TryFrom<CommandComplete<'d>> for CommandCompleteWithStatus<'d> {
+    type Error = FromHciBytesError;
+    fn try_from(e: CommandComplete<'d>) -> Result<CommandCompleteWithStatus<'d>, Self::Error> {
+        if e.cmd_opcode == Opcode::UNSOLICITED {
+            return Err(FromHciBytesError::InvalidSize);
+        }
+        let bytes = e.bytes.into_inner();
+        let (status, remaining) = Status::from_hci_bytes(bytes)?;
+        let return_param_bytes: RemainingBytes<'d> = RemainingBytes::from_hci_bytes_complete(remaining)?;
+        Ok(Self {
+            num_hci_cmd_pkts: e.num_hci_cmd_pkts,
+            cmd_opcode: e.cmd_opcode,
+            status,
+            return_param_bytes,
+        })
+    }
+}
+
+/// Struct representing a command complete event with status
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCompleteWithStatus<'d> {
+    /// Number of packets complete.
+    pub num_hci_cmd_pkts: u8,
+    /// Command opcode.
+    pub cmd_opcode: Opcode,
+    /// Command status.
+    pub status: Status,
+    /// Return parameters
+    pub return_param_bytes: RemainingBytes<'d>,
+}
+
+impl CommandCompleteWithStatus<'_> {
     /// Gets the connection handle associated with the command that has completed.
     ///
     /// For commands that return the connection handle provided as a parameter as
@@ -808,6 +958,8 @@ impl InquiryResultWithRssi<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::OpcodeGroup;
+    use crate::event::le::LeEventPacket;
     use crate::param::*;
 
     #[test]
@@ -1083,5 +1235,112 @@ mod tests {
         assert_eq!(evt.remote_sam_tx_availability, 0x06);
         assert_eq!(evt.remote_sam_rx_availability, 0x07);
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn convert_error_packet() {
+        let data = [
+            0x04, 10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // bd_addr
+            0x20, 0x04, 0x00, // class_of_device
+            0x01, // link_type (ACL)
+        ];
+        let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
+        assert!(matches!(event.kind, EventKind::ConnectionRequest));
+
+        let Event::ConnectionRequest(evt) = Event::try_from(event).unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(evt.bd_addr.raw(), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(evt.class_of_device, [0x20, 0x04, 0x00]);
+        assert_eq!(evt.link_type, ConnectionLinkType::Acl);
+    }
+
+    #[test]
+    fn convert_le_error_packet() {
+        let data = [
+            0x3e, 19, // header
+            1,  // subevent
+            0,  // success
+            1, 0, // handle
+            0, // role
+            1, // kind
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // bd_addr
+            0x10, 0x10, // interval
+            0x00, 0x00, // latency
+            0x10, 0x10, // supervision timeout
+            1,    // accuracy
+        ];
+        let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
+        assert!(matches!(event.kind, EventKind::Le));
+
+        let Event::Le(LeEvent::LeConnectionComplete(e)) = Event::try_from(event).unwrap() else {
+            unreachable!()
+        };
+
+        assert_eq!(e.status, Status::SUCCESS);
+        assert_eq!(e.handle, ConnHandle::new(1));
+        assert!(matches!(e.central_clock_accuracy, ClockAccuracy::Ppm250));
+    }
+
+    #[test]
+    fn parse_le_packet() {
+        let data = [
+            0x3e, 19, // header
+            1,  // subevent
+            0,  // success
+            1, 0, // handle
+            0, // role
+            1, // kind
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // bd_addr
+            0x10, 0x10, // interval
+            0x00, 0x00, // latency
+            0x10, 0x10, // supervision timeout
+            1,    // accuracy
+        ];
+        let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
+        assert!(matches!(event.kind, EventKind::Le));
+        let event = LeEventPacket::from_hci_bytes_complete(event.data).unwrap();
+        assert!(matches!(
+            event.kind,
+            crate::event::le::LeEventKind::LeConnectionComplete
+        ));
+        let e = crate::event::le::LeConnectionComplete::from_hci_bytes_complete(event.data).unwrap();
+
+        assert_eq!(e.status, Status::SUCCESS);
+        assert_eq!(e.handle, ConnHandle::new(1));
+        assert!(matches!(e.central_clock_accuracy, ClockAccuracy::Ppm250));
+    }
+
+    #[test]
+    fn test_special_command_complete() {
+        let data = [
+            0x0e, 3, // header
+            1, 0, 0, // special command
+        ];
+
+        let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
+        assert!(matches!(event.kind, EventKind::CommandComplete));
+        let event = CommandComplete::from_hci_bytes_complete(event.data).unwrap();
+        assert_eq!(event.cmd_opcode, Opcode::new(OpcodeGroup::new(0), 0));
+    }
+
+    #[test]
+    fn test_normal_command_complete() {
+        let opcode = Opcode::new(OpcodeGroup::LE, 0x000D).to_raw().to_le_bytes();
+        let data = [
+            0x0e, 4, // header
+            1, opcode[0], opcode[1], // special command
+            0,         // success
+        ];
+
+        let event = EventPacket::from_hci_bytes_complete(&data).unwrap();
+        assert!(matches!(event.kind, EventKind::CommandComplete));
+        let event = CommandComplete::from_hci_bytes_complete(event.data).unwrap();
+        assert_eq!(event.cmd_opcode, Opcode::new(OpcodeGroup::LE, 0x000d));
+
+        let event: CommandCompleteWithStatus = event.try_into().unwrap();
+        assert_eq!(event.cmd_opcode, Opcode::new(OpcodeGroup::LE, 0x000d));
+        assert_eq!(Status::SUCCESS, event.status);
     }
 }

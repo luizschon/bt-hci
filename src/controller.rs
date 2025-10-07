@@ -13,10 +13,10 @@ use embedded_io::ErrorType;
 use futures_intrusive::sync::LocalSemaphore;
 
 use crate::cmd::{Cmd, CmdReturnBuf};
-use crate::event::{CommandComplete, Event};
+use crate::event::{CommandComplete, CommandCompleteWithStatus, CommandStatus, EventKind};
 use crate::param::{RemainingBytes, Status};
 use crate::transport::Transport;
-use crate::{cmd, data, ControllerToHostPacket, FixedSizeValue, FromHciBytes};
+use crate::{cmd, data, ControllerToHostPacket, FixedSizeValue, FromHciBytes, FromHciBytesError};
 
 pub mod blocking;
 
@@ -77,6 +77,7 @@ where
 impl<T, const SLOTS: usize> Controller for ExternalController<T, SLOTS>
 where
     T: Transport,
+    T::Error: From<FromHciBytesError>,
 {
     async fn write_acl_data(&self, packet: &data::AclPacket<'_>) -> Result<(), Self::Error> {
         self.transport.write(packet).await?;
@@ -100,8 +101,13 @@ where
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
                 let value = self.transport.read(&mut buf[..]).await?;
                 match value {
-                    ControllerToHostPacket::Event(ref event) => match &event {
-                        Event::CommandComplete(e) => {
+                    ControllerToHostPacket::Event(ref event) => match event.kind {
+                        EventKind::CommandComplete => {
+                            let e = CommandComplete::from_hci_bytes_complete(event.data)?;
+                            if !e.has_status() {
+                                return Ok(value);
+                            }
+                            let e: CommandCompleteWithStatus = e.try_into()?;
                             self.slots.complete(
                                 e.cmd_opcode,
                                 e.status,
@@ -110,7 +116,8 @@ where
                             );
                             continue;
                         }
-                        Event::CommandStatus(e) => {
+                        EventKind::CommandStatus => {
+                            let e = CommandStatus::from_hci_bytes_complete(event.data)?;
                             self.slots
                                 .complete(e.cmd_opcode, e.status, e.num_hci_cmd_pkts as usize, &[]);
                             continue;
@@ -127,6 +134,7 @@ where
 impl<T, const SLOTS: usize> blocking::Controller for ExternalController<T, SLOTS>
 where
     T: crate::transport::blocking::Transport,
+    T::Error: From<FromHciBytesError>,
 {
     fn write_acl_data(&self, packet: &data::AclPacket<'_>) -> Result<(), Self::Error> {
         loop {
@@ -192,8 +200,13 @@ where
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
                 let value = self.transport.read(&mut buf[..])?;
                 match value {
-                    ControllerToHostPacket::Event(ref event) => match &event {
-                        Event::CommandComplete(e) => {
+                    ControllerToHostPacket::Event(ref event) => match event.kind {
+                        EventKind::CommandComplete => {
+                            let e = CommandComplete::from_hci_bytes_complete(event.data)?;
+                            if !e.has_status() {
+                                return Ok(value);
+                            }
+                            let e: CommandCompleteWithStatus = e.try_into()?;
                             self.slots.complete(
                                 e.cmd_opcode,
                                 e.status,
@@ -202,7 +215,8 @@ where
                             );
                             continue;
                         }
-                        Event::CommandStatus(e) => {
+                        EventKind::CommandStatus => {
+                            let e = CommandStatus::from_hci_bytes_complete(event.data)?;
                             self.slots
                                 .complete(e.cmd_opcode, e.status, e.num_hci_cmd_pkts as usize, &[]);
                             continue;
@@ -221,6 +235,7 @@ where
     T: Transport,
     C: cmd::SyncCmd,
     C::Return: FixedSizeValue,
+    T::Error: From<FromHciBytesError>,
 {
     async fn exec(&self, cmd: &C) -> Result<C::Return, cmd::Error<Self::Error>> {
         let mut retval: C::ReturnBuf = C::ReturnBuf::new();
@@ -235,7 +250,7 @@ where
 
         let result = slot.wait().await;
         let return_param_bytes = RemainingBytes::from_hci_bytes_complete(&retval.as_ref()[..result.len]).unwrap();
-        let e = CommandComplete {
+        let e = CommandCompleteWithStatus {
             num_hci_cmd_pkts: 0,
             status: result.status,
             cmd_opcode: C::OPCODE,
@@ -251,6 +266,7 @@ impl<T, C, const SLOTS: usize> ControllerCmdAsync<C> for ExternalController<T, S
 where
     T: Transport,
     C: cmd::AsyncCmd,
+    T::Error: From<FromHciBytesError>,
 {
     async fn exec(&self, cmd: &C) -> Result<(), cmd::Error<Self::Error>> {
         let (slot, idx) = self.slots.acquire(C::OPCODE, &mut []).await;
@@ -402,5 +418,62 @@ impl<F: FnOnce()> OnDrop<F> {
 impl<F: FnOnce()> Drop for OnDrop<F> {
     fn drop(&mut self) {
         unsafe { self.f.as_ptr().read()() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub struct TestTransport<'d> {
+        pub rx: &'d [u8],
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Error;
+
+    impl From<FromHciBytesError> for Error {
+        fn from(_: FromHciBytesError) -> Self {
+            Self
+        }
+    }
+
+    impl ErrorType for TestTransport<'_> {
+        type Error = Error;
+    }
+    impl embedded_io::Error for Error {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::Other
+        }
+    }
+    impl Transport for TestTransport<'_> {
+        fn read<'a>(&self, rx: &'a mut [u8]) -> impl Future<Output = Result<ControllerToHostPacket<'a>, Self::Error>> {
+            async {
+                let to_read = rx.len().min(self.rx.len());
+
+                rx[..to_read].copy_from_slice(&self.rx[..to_read]);
+                let pkt = ControllerToHostPacket::from_hci_bytes_complete(&rx[..to_read])?;
+                Ok(pkt)
+            }
+        }
+
+        fn write<T: crate::HostToControllerPacket>(&self, _val: &T) -> impl Future<Output = Result<(), Self::Error>> {
+            async { todo!() }
+        }
+    }
+
+    #[futures_test::test]
+    pub async fn test_can_handle_unsolicited_command_complete() {
+        let t = TestTransport {
+            rx: &[
+                4, 0x0e, 3, // header
+                1, 0, 0, // special command
+            ],
+        };
+        let c: ExternalController<_, 10> = ExternalController::new(t);
+
+        let mut rx = [0; 255];
+        let pkt = c.read(&mut rx).await;
+        assert!(pkt.is_ok());
     }
 }
