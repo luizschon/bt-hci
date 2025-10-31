@@ -114,7 +114,13 @@ macro_rules! le_events {
                 fn from_hci_bytes(data: &'a [u8]) -> Result<(Self, &'a [u8]), $crate::FromHciBytesError> {
                     let total = 0;
                     $(
-                        let ($field, data) = <$ty as $crate::FromHciBytes>::from_hci_bytes(data)?;
+                        let ($field, data) = if let Ok(v) = <$ty as $crate::FromHciBytes>::from_hci_bytes(data) {
+                            v
+                        } else {
+                            #[cfg(feature = "defmt")]
+                            ::defmt::info!("Failed missing {:?}", data);
+                            return Err($crate::FromHciBytesError::InvalidValue);
+                        };
                     )*
                     Ok((Self {
                         $($field,)*
