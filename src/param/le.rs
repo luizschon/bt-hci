@@ -379,6 +379,7 @@ param! {
         AoA = 0,
         AoD1Us = 1,
         AoD2Us = 2,
+        NoCte = 0xFF,
     }
 }
 

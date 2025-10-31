@@ -118,7 +118,7 @@ macro_rules! le_events {
                             v
                         } else {
                             #[cfg(feature = "defmt")]
-                            ::defmt::info!("Failed missing {:?}", data);
+                            ::defmt::error!("Failed missing {:?}", data);
                             return Err($crate::FromHciBytesError::InvalidValue);
                         };
                     )*
@@ -269,7 +269,6 @@ le_events! {
         rssi: i8,
         cte_kind: CteKind,
         data_status: DataStatus,
-        len: u8,
         data: &'a [u8],
     }
 
