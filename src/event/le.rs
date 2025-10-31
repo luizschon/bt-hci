@@ -263,6 +263,7 @@ le_events! {
         rssi: i8,
         cte_kind: CteKind,
         data_status: DataStatus,
+        len: u8,
         data: &'a [u8],
     }
 
